@@ -20,6 +20,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
 // ===================== Types & Config =====================
@@ -52,6 +53,7 @@ type Flags struct {
 	PartSizeMB          int64
 	UploaderConcurrency int
 	UploadParallel      int
+	QueueTimeout        time.Duration
 }
 
 type FileItem struct {
@@ -95,6 +97,33 @@ func must(err error) {
 	if err != nil {
 		log.Fatal(err)
 	}
+}
+
+// validateBucket tests bucket connectivity and configuration
+func validateBucket(ctx context.Context, client *s3.Client, bucket string, useAccel bool) error {
+	// Test basic connectivity by listing objects (limit to 1)
+	_, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+		Bucket:  aws.String(bucket),
+		MaxKeys: aws.Int32(1),
+	})
+	if err != nil {
+		return fmt.Errorf("cannot access bucket %s: %w", bucket, err)
+	}
+
+	// If using transfer acceleration, verify it's enabled
+	if useAccel {
+		accel, err := client.GetBucketAccelerateConfiguration(ctx, &s3.GetBucketAccelerateConfigurationInput{
+			Bucket: aws.String(bucket),
+		})
+		if err != nil {
+			return fmt.Errorf("cannot check transfer acceleration for bucket %s: %w", bucket, err)
+		}
+		if accel.Status != types.BucketAccelerateStatusEnabled {
+			return fmt.Errorf("transfer acceleration is not enabled on bucket %s (status: %s)", bucket, accel.Status)
+		}
+	}
+
+	return nil
 }
 
 func isPNG(p string) bool {
@@ -471,6 +500,7 @@ func main() {
 		partSizeMB          = flag.Int64("part-size-mb", 16, "Multipart part size in MiB (min 5)")
 		uploaderConcurrency = flag.Int("uploader-concurrency", runtime.NumCPU(), "Multipart concurrency per large file")
 		uploadParallel      = flag.Int("upload-parallel", 1, "Number of files uploaded in parallel within a batch")
+		queueTimeout        = flag.Duration("queue-timeout", 60*time.Second, "Timeout for upload queue (for slow networks)")
 	)
 	flag.Parse()
 
@@ -528,6 +558,17 @@ func main() {
 	must(err)
 	upl.uploadParallel = *uploadParallel
 
+	// Validate bucket connectivity and configuration
+	if v >= V1 {
+		fmt.Printf("[validate] testing bucket connectivity...\n")
+	}
+	if err := validateBucket(ctx, upl.client, target, *accel && !useArnRegion); err != nil {
+		log.Fatalf("bucket validation failed: %v", err)
+	}
+	if v >= V1 {
+		fmt.Printf("[validate] bucket connectivity verified ✓\n")
+	}
+
 	// Print S3 configuration for debugging
 	if v >= V1 {
 		fmt.Printf("[config] target=%s prefix=%s accel=%v mrap=%v part-size=%dMB uploader-concurrency=%d upload-parallel=%d\n",
@@ -563,8 +604,8 @@ func main() {
 		}
 	}
 
-	// Upload queue with capacity 4 to handle compression/upload speed mismatch
-	uploadQueue := make(chan *Batch, 4)
+	// Upload queue with larger capacity to handle slow networks
+	uploadQueue := make(chan *Batch, 10)
 	var uploadErr atomic.Value
 	var wg sync.WaitGroup
 
@@ -576,11 +617,22 @@ func main() {
 			if v >= V1 {
 				fmt.Printf("[batch upload start] id=%d files=%d size=%.2fMB\n", b.ID, len(b.Items), mb(b.TotalOut))
 			}
+
+			// Add upload progress feedback for slow networks
+			uploadStart := time.Now()
 			err := upl.UploadBatch(ctx, b)
+			uploadDur := time.Since(uploadStart)
+
 			if err != nil {
 				fmt.Printf("[upload error] batch=%d error=%v\n", b.ID, err)
 				uploadErr.Store(err)
 				return
+			}
+
+			// Show upload progress for slow uploads
+			if v >= V1 && uploadDur > 30*time.Second {
+				fmt.Printf("[upload progress] batch=%d completed in %s (%.2f MB/s)\n",
+					b.ID, uploadDur, mb(b.TotalOut)/uploadDur.Seconds())
 			}
 			if v >= V1 {
 				if v >= V2 {
@@ -631,6 +683,7 @@ func main() {
 
 	// Producer: prepare batches and queue
 	batchID := 1
+	lastProgress := time.Now()
 	for i := 0; i < len(files); {
 		if errVal := uploadErr.Load(); errVal != nil {
 			log.Fatalf("upload failed: %v", errVal.(error))
@@ -653,13 +706,39 @@ func main() {
 			}
 		}
 
-		// Send batch to upload queue with timeout to prevent deadlock
+		// Send batch to upload queue with adaptive timeout and progress feedback
 		select {
 		case uploadQueue <- b:
 			// Successfully queued
-		case <-time.After(30 * time.Second):
-			log.Fatalf("upload queue full for 30 seconds - upload is too slow, consider reducing --upload-parallel or --batch-size")
+			if v >= V1 {
+				queueLen := len(uploadQueue)
+				if queueLen > 5 {
+					fmt.Printf("[queue] batch %d queued (queue depth: %d)\n", b.ID, queueLen)
+				}
+			}
+		case <-time.After(*queueTimeout):
+			// Instead of failing, show warning and continue with reduced parallelism
+			fmt.Printf("[warn] upload queue full for %s - uploads are very slow\n", *queueTimeout)
+			fmt.Printf("[warn] continuing with current settings, but consider reducing --upload-parallel or --batch-size\n")
+
+			// Try again with a longer timeout
+			select {
+			case uploadQueue <- b:
+				if v >= V1 {
+					fmt.Printf("[queue] batch %d queued after retry\n", b.ID)
+				}
+			case <-time.After(120 * time.Second):
+				log.Fatalf("upload queue still full after 3 minutes - network may be too slow for current settings")
+			}
 		}
+
+		// Show periodic progress for long-running operations
+		if v >= V1 && time.Since(lastProgress) > 30*time.Second {
+			progress := float64(i) / float64(len(files)) * 100
+			fmt.Printf("[progress] %.1f%% complete (%d/%d files processed)\n", progress, i, len(files))
+			lastProgress = time.Now()
+		}
+
 		i = end
 		batchID++
 	}

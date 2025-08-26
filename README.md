@@ -8,6 +8,7 @@ This version adds:
 - **S3 Multi-Region Access Point**: `--mrap-arn` for global access points.
 - **Multipart tuning**: `--part-size-mb` and `--uploader-concurrency` for S3 upload optimization.
 - **File-level parallelism**: `--upload-parallel` for concurrent file uploads within batches.
+- **Network resilience**: Adaptive queue management and configurable timeouts for varying network conditions.
 
 ## Prerequisites
 
@@ -89,11 +90,23 @@ GOOS=darwin GOARCH=amd64 go build -o uploader-darwin-amd64 .
 ### Native libjxl Build (Advanced)
 
 ```bash
-# Enable native libjxl compression (requires CGO binding)
+# Enable native libjxl compression (requires CGO and libjxl development headers)
 go build -tags libjxl -o uploader-libjxl .
 ```
 
-> **Note**: The `libjxl` mode requires compiling with `-tags libjxl` and linking a CGO-based wrapper. In this starter, the `libjxl` compressor is a stub that returns an informative error unless you add the binding.
+**Prerequisites for libjxl build:**
+```bash
+# Ubuntu/Debian
+sudo apt-get install libjxl-dev pkg-config
+
+# macOS
+brew install libjxl pkg-config
+
+# Verify pkg-config can find libjxl
+pkg-config --libs libjxl
+```
+
+> **Note**: The `libjxl` mode provides native compression without shelling out to the `cjxl` command line tool, which can be more efficient and reliable. It requires CGO and the libjxl development headers to be installed.
 
 ### Build Verification
 
@@ -145,6 +158,7 @@ After building, verify the executable works:
 - `--part-size-mb` (int): multipart part size in MiB (default **16**, min 5).
 - `--uploader-concurrency` (int): multipart concurrency per large file (default **CPU cores**).
 - `--upload-parallel` (int): number of files uploaded in parallel within a batch (default **1**).
+- `--queue-timeout` (duration): timeout for upload queue, useful for slow networks (default **1m0s**).
 
 ### How the pipeline works
 
@@ -153,7 +167,7 @@ After building, verify the executable works:
    - **`cjxl`** (external tool) with effort 5 default, or
    - **`libjxl`** (compile-time option; stubbed here—add your CGO binding later).
 3. **Upload stage**: exactly **one batch uploads at a time** (to avoid saturating clinic WAN), via AWS SDK for Go v2 `manager.Uploader` (multipart + persistent connections).  
-4. **Overlap**: while batch *N* uploads, batch *N+1* compresses, up to a queue depth of 2 (prevents temp-disk bloat).
+4. **Overlap**: while batch *N* uploads, batch *N+1* compresses, up to a queue depth of 10 (adaptive for slow networks).
 5. **Auto-tune**: after each upload, compares compression vs. upload time and adjusts batch size to keep both stages busy.
 6. **Parallel uploads**: within each batch, `--upload-parallel` files can upload concurrently (default 1 to be gentle on WAN).
 
@@ -175,10 +189,29 @@ After building, verify the executable works:
 
 - Uses **distance 0** (lossless) and **effort 5**. You can change the effort by editing the `cjxl` arguments in `jxl_cjxl.go` if you find a better CPU/ratio tradeoff for your device.
 
-### Swapping in native libjxl
+### Native libjxl Support
 
-- Add a `jxl_native.go` file with `//go:build libjxl` and implement `LibjxlCompressor` using CGO calls into the libjxl C API.
-- Build with `-tags libjxl`. When present, `--compressor libjxl` will use your native path; otherwise the stub returns a friendly error.
+The uploader now includes full native libjxl support:
+
+- **Built-in implementation**: `jxl_native.go` provides CGO bindings to libjxl C API
+- **Lossless compression**: Uses distance 0 for pixel-perfect compression
+- **Parallel processing**: Leverages libjxl's built-in threading
+- **No external dependencies**: No need for `cjxl` command line tool when using `--compressor libjxl`
+
+**Usage:**
+```bash
+# Build with native libjxl support
+go build -tags libjxl -o uploader-libjxl .
+
+# Use native compression
+./uploader-libjxl --compressor libjxl -input-dir /path/to/images -bucket-name my-bucket
+```
+
+**Benefits over cjxl:**
+- **Faster**: No process spawning overhead
+- **More reliable**: No external tool dependencies
+- **Better integration**: Direct memory management and error handling
+- **Cross-platform**: Works on any platform with libjxl development headers
 
 ### Example output (verbosity=2)
 
@@ -199,4 +232,5 @@ SUMMARY | files=4800 in=8123.17MB out=5510.51MB ratio=0.679 time=13m42s throughp
 - For **long-haul clinics**, enable `--accel` and consider larger `--part-size-mb` (32-64 MiB).
 - For **global deployments**, use `--mrap-arn` for automatic region failover.
 - For **high-bandwidth clinics**, increase `--upload-parallel` (2-4) for faster batch uploads.
+- For **very slow networks**, increase `--queue-timeout` (e.g., `--queue-timeout 5m`) to prevent premature failures.
 - Consider enabling **S3 Transfer Acceleration** on the bucket and pointing your AWS config to the accelerate endpoint for long-haul clinics.
